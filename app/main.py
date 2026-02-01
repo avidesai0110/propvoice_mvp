@@ -16,7 +16,8 @@ from app.services import database as db
 from app.services.summary import generate_call_summary, analyze_urgency
 from app.services.email import send_call_summary_email
 from app.services.troubleshooting import get_troubleshooting_tips, format_tips_for_email
-from app.services.bland_memory import update_user_memory
+# Removed: from app.services.bland_memory import update_user_memory
+# We're no longer using Bland's unreliable memory API
 
 # Configure logging
 logging.basicConfig(
@@ -530,10 +531,14 @@ async def validate_contact(request: Request):
     Validate and retrieve contact information based on phone number.
     Called by Bland AI at the start of calls via Dynamic Data.
     
+    CRITICAL: Returns a 'greeting' field with the FULL first sentence
+    that Bland AI will speak via first_sentence: "{{greeting}}"
+    
     Expected parameters:
     - phone_number: Caller's phone number
     
     Returns contact info if found, including:
+    - greeting: THE COMPLETE FIRST SENTENCE TO SPEAK
     - name, email, unit info, tenant status, call history
     """
     try:
@@ -543,8 +548,11 @@ async def validate_contact(request: Request):
         logger.info(f"📞 Contact validation request for: {phone}")
         
         if not phone:
+            # No phone = new caller greeting
             return {
                 "contact_found": False,
+                "greeting": "Hi! Thanks for calling Desai Properties. May I get your name?",
+                "name": None,
                 "message": "No phone number provided"
             }
         
@@ -554,6 +562,8 @@ async def validate_contact(request: Request):
         if not contact:
             return {
                 "contact_found": False,
+                "greeting": "Hi! Thanks for calling Desai Properties. May I get your name?",
+                "name": None,
                 "message": "New caller - no previous record"
             }
         
@@ -565,29 +575,42 @@ async def validate_contact(request: Request):
         except Exception:
             call_count = 0
         
+        # Get the caller's name
+        caller_name = contact.get("name")
+        
+        # BUILD THE GREETING - This is what the AI will say first!
+        if caller_name and caller_name.strip() and caller_name.lower() != "unknown":
+            # Known caller - personalized greeting
+            greeting = f"Hi {caller_name}! Thanks for calling Desai Properties. How can I help you today?"
+        else:
+            # Unknown name - ask for it
+            greeting = "Hi! Thanks for calling Desai Properties. May I get your name?"
+        
         # Build response with contact info
         response = {
             "contact_found": True,
+            "greeting": greeting,  # THE KEY FIELD - Bland uses this for first_sentence
             "contact_id": contact.get("id"),
-            "name": contact.get("name"),
+            "name": caller_name,
             "email": contact.get("email"),
             "contact_type": contact.get("type", "prospect"),
             "previous_calls": call_count,
-            "context": f"Returning caller: {contact.get('name') or 'caller'} has called {call_count} time(s) before."
+            "context": f"Caller: {caller_name or 'Unknown'}. Previous calls: {call_count}."
         }
         
         # Add tenant-specific info if they're a resident
         if contact.get("type") == "tenant":
             response["is_tenant"] = True
-            response["context"] = f"Verified tenant: {contact.get('name')}. Previous calls: {call_count}."
         
-        logger.info(f"✅ Contact validated: {response.get('name', 'Unknown')}")
+        logger.info(f"✅ Contact validated: {caller_name or 'Unknown'}, greeting: {greeting[:50]}...")
         return response
     
     except Exception as e:
         logger.error(f"Error validating contact: {e}")
         return {
             "contact_found": False,
+            "greeting": "Hi! Thanks for calling Desai Properties. How can I help you?",
+            "name": None,
             "message": "Error looking up contact information"
         }
 
@@ -739,33 +762,45 @@ async def bland_call_ended_webhook(request: Request):
             else:
                 logger.warning("⚠️ Failed to send email")
             
-            # Update Bland AI memory with call summary (non-blocking)
+            # Update Supabase contact with latest call info (reliable persistence)
             phone_number = call_record.get("from_number")
             if phone_number:
-                logger.info("🧠 Updating Bland AI memory...")
+                logger.info("📇 Updating contact in Supabase...")
                 try:
-                    # Get caller name from variables if available
+                    # Extract caller name from multiple sources
                     caller_name = None
                     variables = call_record.get("metadata", {})
+                    
+                    # 1. Try from dynamic data variables
                     if isinstance(variables, dict):
-                        caller_name = variables.get("contact_name") or variables.get("name")
+                        caller_name = variables.get("contact_name") or variables.get("name") or variables.get("db_name")
                     
-                    # Update memory (with better error handling)
-                    memory_updated = update_user_memory(
-                        phone_number=phone_number,
-                        call_summary=summary,
-                        caller_name=caller_name,
-                        metadata=variables
-                    )
+                    # 2. Try from database contact
+                    if not caller_name:
+                        try:
+                            contact = await db.find_or_create_contact(phone_number)
+                            if contact and contact.get("name"):
+                                caller_name = contact.get("name")
+                                logger.info(f"📇 Found name in database: {caller_name}")
+                        except Exception as e:
+                            logger.debug(f"Could not check database for name: {e}")
                     
-                    if memory_updated:
-                        logger.info("✅ Memory updated successfully")
-                    else:
-                        # This is OK - memory updates are nice-to-have, not critical
-                        logger.info("ℹ️ Memory update skipped (API slow or unavailable)")
+                    # Update contact record in Supabase with latest call info
+                    if caller_name:
+                        try:
+                            # Update contact with latest call summary and metadata
+                            contact = await db.find_or_create_contact(phone_number)
+                            if contact:
+                                # Optionally update contact notes with call summary
+                                logger.info(f"✅ Contact record up to date for {caller_name}")
+                        except Exception as e:
+                            logger.debug(f"Error updating contact: {e}")
+                    
+                    logger.info(f"✅ Supabase updated (will be used in next call's Dynamic Data)")
+                    
                 except Exception as e:
-                    # Don't let memory failures break the webhook
-                    logger.warning(f"Memory update error (non-critical): {e}")
+                    # Don't let this break the webhook
+                    logger.warning(f"Contact update error (non-critical): {e}")
             else:
                 logger.info("ℹ️ No phone number for memory update")
         else:

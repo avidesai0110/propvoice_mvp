@@ -248,16 +248,25 @@ async def find_or_create_contact(
 ) -> Optional[Dict[str, Any]]:
     """
     Find an existing contact by phone or create a new one
+    Uses direct REST API calls to avoid Supabase client issues
     """
     try:
-        supabase = get_supabase()
+        REST_URL, REST_HEADERS = _get_rest_config()
+        
+        # URL encode the phone number properly
+        import urllib.parse
+        encoded_phone = urllib.parse.quote(phone, safe='')
         
         # Try to find existing contact
-        result = supabase.table("contacts").select("*").eq("phone", phone).limit(1).execute()
+        query_url = f"{REST_URL}/contacts?phone=eq.{encoded_phone}&limit=1"
+        response = requests.get(query_url, headers=REST_HEADERS, timeout=10)
         
-        if result.data:
+        if response.status_code == 200 and response.json():
+            # Contact found
+            contact = response.json()[0]
+            logger.info(f"✅ Contact found: {contact.get('name') or 'Unknown'} ({contact.get('phone')})")
+            
             # Update existing contact if new info provided
-            contact = result.data[0]
             updates = {}
             if name and not contact.get("name"):
                 updates["name"] = name
@@ -265,19 +274,33 @@ async def find_or_create_contact(
                 updates["email"] = email
             
             if updates:
-                supabase.table("contacts").update(updates).eq("id", contact["id"]).execute()
+                update_url = f"{REST_URL}/contacts?id=eq.{contact['id']}"
+                requests.patch(update_url, headers=REST_HEADERS, json=updates, timeout=10)
+                logger.info(f"📝 Updated contact with new info: {updates}")
             
             return contact
         
-        # Create new contact
+        # No contact found - create a new one
+        logger.info(f"📞 New caller detected: {phone}. Creating contact...")
+        
         new_contact = {
             "phone": phone,
             "name": name,
             "email": email,
             "type": contact_type
         }
-        result = supabase.table("contacts").insert(new_contact).execute()
-        return result.data[0] if result.data else None
+        
+        insert_url = f"{REST_URL}/contacts"
+        insert_headers = {**REST_HEADERS, "Prefer": "return=representation"}
+        response = requests.post(insert_url, headers=insert_headers, json=new_contact, timeout=10)
+        
+        if response.status_code in [200, 201] and response.json():
+            created_contact = response.json()[0]
+            logger.info(f"✅ New contact created: ID {created_contact['id']} for {phone}")
+            return created_contact
+        
+        logger.error(f"❌ Failed to create contact: {response.status_code} - {response.text}")
+        return None
     
     except Exception as e:
         logger.error(f"Error finding/creating contact: {e}")

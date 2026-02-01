@@ -201,26 +201,28 @@ def _format_summary_for_memory(call_summary: Dict, caller_name: Optional[str] = 
 
 
 def _format_metadata(metadata: Optional[Dict], caller_name: Optional[str] = None) -> str:
-    """Format metadata for Bland AI memory storage"""
+    """Format metadata for Bland AI memory storage with NAME= format"""
     meta_parts = []
     
+    # CRITICAL: Use NAME= format that the agent looks for
     if caller_name:
-        meta_parts.append(f"Name: {caller_name}")
+        meta_parts.append(f"NAME={caller_name}")
     
     if metadata:
         # Add tenant status
         if metadata.get("is_tenant"):
-            meta_parts.append("Status: Tenant")
+            meta_parts.append("TYPE=Tenant")
         else:
-            meta_parts.append("Status: Prospect")
+            meta_parts.append("TYPE=Prospect")
         
         # Add unit info
         if metadata.get("unit_number"):
-            meta_parts.append(f"Unit: {metadata['unit_number']}")
+            meta_parts.append(f"UNIT={metadata['unit_number']}")
         
-        # Add contact method preference
-        if metadata.get("preferred_contact"):
-            meta_parts.append(f"Prefers: {metadata['preferred_contact']}")
+        # Add email
+        email = metadata.get("contact_email") or metadata.get("email")
+        if email:
+            meta_parts.append(f"EMAIL={email}")
     
     return " | ".join(meta_parts) if meta_parts else "Property caller"
 
