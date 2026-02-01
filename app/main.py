@@ -15,6 +15,8 @@ from app.config import settings
 from app.services import database as db
 from app.services.summary import generate_call_summary, analyze_urgency
 from app.services.email import send_call_summary_email
+from app.services.troubleshooting import get_troubleshooting_tips, format_tips_for_email
+from app.services.bland_memory import update_user_memory
 
 # Configure logging
 logging.basicConfig(
@@ -298,30 +300,71 @@ async def create_maintenance_ticket(request: Request):
                            "Let me transfer you to our maintenance team directly."
             }
         
+        # Get troubleshooting tips for this issue
+        tips_data = get_troubleshooting_tips(issue_type, description, urgency)
+        tips = tips_data.get("tips", [])
+        
         # Format response based on urgency
         ticket_number = ticket.get("ticket_number", str(ticket["id"])[:8])
         
-        urgency_responses = {
-            "emergency": (
+        # Build response
+        if urgency == "emergency":
+            response = (
                 f"I've created an emergency work order, ticket number {ticket_number}. "
                 f"I'm dispatching our emergency maintenance team right now. "
+                f"For your safety, please do not attempt any repairs yourself. "
                 f"Someone will be there within 2 hours. Please make sure they can access your unit. "
                 f"Is there anything else you need while you wait?"
-            ),
-            "urgent": (
-                f"I've created an urgent maintenance ticket, number {ticket_number}. "
-                f"Our team will be out within 24 hours to take care of this. "
-                f"We'll call you before arriving. Is there a specific time that works best for you?"
-            ),
-            "routine": (
-                f"I've created maintenance ticket number {ticket_number} for you. "
-                f"Our team will schedule this within 3 to 5 business days. "
-                f"We'll call you the day before to confirm a time. "
-                f"Is there anything else I can help you with today?"
             )
-        }
+        elif tips and urgency in ["urgent", "routine"]:
+            # Provide troubleshooting tips for non-emergency issues
+            response = f"I've created maintenance ticket number {ticket_number}. "
+            
+            if urgency == "urgent":
+                response += "Our team will be out within 24 hours. "
+            else:
+                response += "Our team will schedule this within 3 to 5 business days. "
+            
+            response += "While you wait, here are some quick steps you can try: "
+            
+            # Speak up to 2 tips over the phone
+            for i, tip in enumerate(tips[:2], 1):
+                response += f"{i}. {tip}. "
+            
+            response += "These might help resolve the issue, but our team will follow up regardless. Is there anything else I can help you with?"
+        else:
+            # Standard response without tips
+            if urgency == "urgent":
+                response = (
+                    f"I've created an urgent maintenance ticket, number {ticket_number}. "
+                    f"Our team will be out within 24 hours to take care of this. "
+                    f"We'll call you before arriving. Is there a specific time that works best for you?"
+                )
+            else:
+                response = (
+                    f"I've created maintenance ticket number {ticket_number} for you. "
+                    f"Our team will schedule this within 3 to 5 business days. "
+                    f"We'll call you the day before to confirm a time. "
+                    f"Is there anything else I can help you with today?"
+                )
         
-        return {"response": urgency_responses.get(urgency, urgency_responses["routine"])}
+        # Store troubleshooting tips in ticket notes for reference
+        if tips:
+            try:
+                supabase = db.get_supabase()
+                await supabase.table("maintenance_tickets").update({
+                    "notes": f"Troubleshooting tips provided: {'; '.join(tips[:3])}"
+                }).eq("id", ticket["id"]).execute()
+            except Exception as e:
+                logger.warning(f"Could not update ticket with troubleshooting tips: {e}")
+        
+        return {
+            "response": response,
+            "ticket_id": ticket["id"],
+            "ticket_number": ticket_number,
+            "troubleshooting_tips": tips[:3] if tips else [],
+            "estimated_resolution": tips_data.get("estimated_resolution")
+        }
     
     except Exception as e:
         logger.error(f"Error in create_ticket: {e}")
@@ -481,6 +524,133 @@ async def get_payment_info(request: Request):
         }
 
 
+@app.post("/tools/validate-contact")
+async def validate_contact(request: Request):
+    """
+    Validate and retrieve contact information based on phone number.
+    Called by Bland AI at the start of calls via Dynamic Data.
+    
+    Expected parameters:
+    - phone_number: Caller's phone number
+    
+    Returns contact info if found, including:
+    - name, email, unit info, tenant status, call history
+    """
+    try:
+        data = await request.json()
+        phone = data.get("phone_number", "").strip()
+        
+        logger.info(f"📞 Contact validation request for: {phone}")
+        
+        if not phone:
+            return {
+                "contact_found": False,
+                "message": "No phone number provided"
+            }
+        
+        # Look up contact in database
+        contact = await db.find_or_create_contact(phone)
+        
+        if not contact:
+            return {
+                "contact_found": False,
+                "message": "New caller - no previous record"
+            }
+        
+        # Get call history count
+        try:
+            supabase = db.get_supabase()
+            call_history = supabase.table("calls").select("id", count="exact").eq("from_number", phone).execute()
+            call_count = call_history.count if call_history else 0
+        except Exception:
+            call_count = 0
+        
+        # Build response with contact info
+        response = {
+            "contact_found": True,
+            "contact_id": contact.get("id"),
+            "name": contact.get("name"),
+            "email": contact.get("email"),
+            "contact_type": contact.get("type", "prospect"),
+            "previous_calls": call_count,
+            "context": f"Returning caller: {contact.get('name') or 'caller'} has called {call_count} time(s) before."
+        }
+        
+        # Add tenant-specific info if they're a resident
+        if contact.get("type") == "tenant":
+            response["is_tenant"] = True
+            response["context"] = f"Verified tenant: {contact.get('name')}. Previous calls: {call_count}."
+        
+        logger.info(f"✅ Contact validated: {response.get('name', 'Unknown')}")
+        return response
+    
+    except Exception as e:
+        logger.error(f"Error validating contact: {e}")
+        return {
+            "contact_found": False,
+            "message": "Error looking up contact information"
+        }
+
+
+@app.post("/tools/get-troubleshooting-tips")
+async def get_troubleshooting_tips_endpoint(request: Request):
+    """
+    Get troubleshooting tips for a maintenance issue.
+    Called by Bland AI after creating a maintenance ticket.
+    
+    Expected parameters:
+    - issue_type: Type of issue (plumbing, electrical, hvac, etc.)
+    - description: Description of the issue
+    - urgency: Urgency level (emergency, urgent, routine)
+    """
+    try:
+        data = await request.json()
+        logger.info(f"🔧 Troubleshooting tips request: {data}")
+        
+        issue_type = data.get("issue_type", "general")
+        description = data.get("description", "")
+        urgency = data.get("urgency", "routine")
+        
+        # Get troubleshooting tips
+        tips_data = get_troubleshooting_tips(issue_type, description, urgency)
+        
+        # Format response for the AI to speak
+        tips = tips_data.get("tips", [])
+        
+        if urgency == "emergency":
+            response = (
+                "This is an emergency situation. For your safety, please do not attempt any repairs yourself. "
+                "Our maintenance team has been notified and will respond immediately. "
+                "If you're in immediate danger, please call 911."
+            )
+        elif tips:
+            response = "While waiting for our maintenance team, here are some troubleshooting steps you can try: "
+            for i, tip in enumerate(tips[:3], 1):  # Speak max 3 tips
+                response += f"{i}. {tip}. "
+            
+            response += f"Our team will follow up within {tips_data.get('estimated_resolution', '1-3 business days')}. "
+            
+            if tips_data.get("can_self_resolve"):
+                response += "If these steps resolve the issue, great! Otherwise, we'll take care of it for you."
+        else:
+            response = "Our maintenance team will assess and resolve your issue. They'll contact you soon."
+        
+        return {
+            "response": response,
+            "tips": tips,
+            "estimated_resolution": tips_data.get("estimated_resolution"),
+            "can_self_resolve": tips_data.get("can_self_resolve", False)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting troubleshooting tips: {e}")
+        return {
+            "response": "Our maintenance team will take care of this issue for you.",
+            "tips": [],
+            "can_self_resolve": False
+        }
+
+
 # ===========================================
 # WEBHOOK ENDPOINTS (Called by Bland AI after calls)
 # ===========================================
@@ -494,30 +664,45 @@ async def bland_call_ended_webhook(request: Request):
     try:
         data = await request.json()
         logger.info(f"📞 Call ended webhook received")
-        logger.debug(f"Webhook data: {json.dumps(data, indent=2)}")
+        logger.info(f"🔍 Full webhook payload: {json.dumps(data, indent=2)}")
         
-        # Extract call data from Bland webhook
+        # Extract call data from Bland webhook (handle both inbound and outbound formats)
+        # Get duration and convert to integer (seconds) - Supabase requires INTEGER not FLOAT
+        raw_duration = data.get("call_length") or data.get("duration") or data.get("corrected_duration") or data.get("length", 0)
+        if isinstance(raw_duration, str):
+            try:
+                duration = int(float(raw_duration))
+            except (ValueError, TypeError):
+                duration = 0
+        elif raw_duration:
+            duration = int(float(raw_duration))  # Ensure float->int conversion
+        else:
+            duration = 0
+        
         call_record = {
-            "bland_call_id": data.get("call_id"),
-            "from_number": data.get("from") or data.get("to_number"),  # Bland uses different field names
-            "to_number": data.get("to") or data.get("from_number"),
-            "duration": data.get("call_length") or data.get("duration", 0),
-            "transcript": data.get("concatenated_transcript") or data.get("transcript", ""),
-            "recording_url": data.get("recording_url"),
-            "started_at": data.get("created_at") or datetime.now().isoformat(),
-            "ended_at": datetime.now().isoformat(),
+            "bland_call_id": data.get("call_id") or data.get("c_id"),
+            "from_number": data.get("from") or data.get("from_number") or data.get("to_number"),
+            "to_number": data.get("to") or data.get("to_number") or data.get("from_number"),
+            "duration": duration,
+            "transcript": data.get("concatenated_transcript") or data.get("transcript") or data.get("transcripts", ""),
+            "recording_url": data.get("recording_url") or data.get("recording"),
+            "started_at": data.get("created_at") or data.get("start_time") or datetime.now().isoformat(),
+            "ended_at": data.get("completed_at") or data.get("end_time") or datetime.now().isoformat(),
             "status": "completed",
-            "metadata": data.get("variables", {})
+            "call_type": "inbound" if data.get("inbound") or data.get("direction") == "inbound" else "outbound",
+            "metadata": data.get("variables") or data.get("pathway_logs") or {}
         }
         
         # Save call to database
+        logger.info(f"💾 Attempting to save call record: {json.dumps({k: v for k, v in call_record.items() if k != 'transcript'}, indent=2)}")
         saved_call = await db.create_call_record(call_record)
         
         if not saved_call:
-            logger.error("Failed to save call record", extra={"call_record": call_record})
+            logger.error(f"❌ Failed to save call record. Call data: {json.dumps(call_record, indent=2)}")
+            # Still return 200 so Bland doesn't retry
             return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": "Failed to save call record", "debug": "Check server logs for REST API error"}
+                status_code=200,
+                content={"status": "error", "message": "Failed to save call record to database", "received": True}
             )
         
         call_id = saved_call["id"]
@@ -553,6 +738,36 @@ async def bland_call_ended_webhook(request: Request):
                 logger.info("✅ Email sent successfully")
             else:
                 logger.warning("⚠️ Failed to send email")
+            
+            # Update Bland AI memory with call summary (non-blocking)
+            phone_number = call_record.get("from_number")
+            if phone_number:
+                logger.info("🧠 Updating Bland AI memory...")
+                try:
+                    # Get caller name from variables if available
+                    caller_name = None
+                    variables = call_record.get("metadata", {})
+                    if isinstance(variables, dict):
+                        caller_name = variables.get("contact_name") or variables.get("name")
+                    
+                    # Update memory (with better error handling)
+                    memory_updated = update_user_memory(
+                        phone_number=phone_number,
+                        call_summary=summary,
+                        caller_name=caller_name,
+                        metadata=variables
+                    )
+                    
+                    if memory_updated:
+                        logger.info("✅ Memory updated successfully")
+                    else:
+                        # This is OK - memory updates are nice-to-have, not critical
+                        logger.info("ℹ️ Memory update skipped (API slow or unavailable)")
+                except Exception as e:
+                    # Don't let memory failures break the webhook
+                    logger.warning(f"Memory update error (non-critical): {e}")
+            else:
+                logger.info("ℹ️ No phone number for memory update")
         else:
             logger.info("ℹ️ No transcript available, skipping summary generation")
         
@@ -568,6 +783,30 @@ async def bland_call_ended_webhook(request: Request):
             status_code=500,
             content={"status": "error", "message": str(e)}
         )
+
+
+@app.api_route("/webhooks/{path:path}", methods=["GET", "POST", "PUT", "PATCH"])
+async def catch_all_webhooks(request: Request, path: str):
+    """
+    Catch-all endpoint for debugging webhook issues.
+    Logs any request to /webhooks/* that doesn't match other endpoints.
+    """
+    try:
+        logger.info(f"🔔 Received {request.method} at /webhooks/{path}")
+        logger.info(f"📋 Headers: {dict(request.headers)}")
+        
+        if request.method in ["POST", "PUT", "PATCH"]:
+            try:
+                data = await request.json()
+                logger.info(f"📦 JSON Body: {json.dumps(data, indent=2)}")
+            except:
+                body = await request.body()
+                logger.info(f"📦 Raw Body: {body.decode('utf-8', errors='ignore')[:1000]}")
+        
+        return {"status": "received", "path": path, "method": request.method}
+    except Exception as e:
+        logger.error(f"Error in catch-all webhook: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 # ===========================================

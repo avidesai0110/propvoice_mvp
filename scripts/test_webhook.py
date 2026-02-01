@@ -14,13 +14,28 @@ load_dotenv()
 WEBHOOK_URL = "http://localhost:8000/webhooks/bland/call-ended"
 
 test_data = {
-    "call_id": "test-call-direct-789",
-    "from": "+16309438357",
-    "to": "+15551234567",
-    "call_length": 120,
-    "concatenated_transcript": "Agent: Thank you for calling Desai Property. Caller: I'm looking for a 2 bedroom. Agent: I found units for you.",
-    "recording_url": "https://example.com/recording.mp3",
-    "created_at": "2025-01-30T20:00:00Z",
+    "call_id": "test-inbound-call-123",
+    "c_id": "test-inbound-call-123",
+    "to": "+16307963284",  # Your inbound number
+    "from": "+16309438357",  # Caller's number
+    "call_length": 145,
+    "duration": 145,
+    "concatenated_transcript": "Agent: Thank you for calling Desai Property, this is your virtual assistant. How can I help you today? Caller: Hi, I'm interested in renting a 2 bedroom apartment. Agent: Great! Let me check our available units for you. I found several 2 bedroom units available. Would you like to schedule a tour?",
+    "transcript": "Agent: Thank you for calling Desai Property, this is your virtual assistant. How can I help you today? Caller: Hi, I'm interested in renting a 2 bedroom apartment. Agent: Great! Let me check our available units for you. I found several 2 bedroom units available. Would you like to schedule a tour?",
+    "recording_url": "https://example.com/recording-inbound.mp3",
+    "created_at": "2026-01-31T18:50:00Z",
+    "completed_at": "2026-01-31T18:52:25Z",
+    "inbound": True,
+    "direction": "inbound",
+    "answered": True,
+    "queue_status": "completed",
+    "endpoint_url": "https://acerbic-madalynn-nonthoracic.ngrok-free.dev",
+    "max_duration": 10,
+    "error_message": None,
+    "variables": {
+        "inquiry_type": "leasing",
+        "bedrooms_requested": "2"
+    }
 }
 
 print(f"Testing webhook: {WEBHOOK_URL}")

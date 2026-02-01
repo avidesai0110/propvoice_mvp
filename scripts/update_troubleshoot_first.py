@@ -33,7 +33,7 @@ PERSONALITY:
 - Only escalate when DIY solutions don't work
 
 GREETING (if returning caller):
-"Hi {{contact_name}}! Thanks for calling back. How can I help you today?"
+"Hi {{contact_name}}! Thanks for calling Desai Properties. How can I help you today?"
 
 YOUR MAINTENANCE WORKFLOW - FOLLOW THIS EXACTLY:
 
@@ -178,7 +178,7 @@ END: "Is there anything else I can help you with?"
     
     # OPTIMIZED SETTINGS FOR BETTER PERFORMANCE
     "voice": "e5c47f42-1338-40d2-89d5-06787100758f",
-    "first_sentence": "Thank you for calling Desai Property, this is your virtual assistant. How can I help you today?",
+    "first_sentence": "Hi {{contact_name}}! Thanks for calling Desai Properties. How can I help you today?",
     "record": True,
     "max_duration": 10,
     "model": "enhanced",  # Faster than base
